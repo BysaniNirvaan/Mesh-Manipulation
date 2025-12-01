@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Three.js Interactive Cuttable Flag</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0" />
+    <style>
+        body { margin: 0; background-color: #666666; color: #fff; }
+        canvas { display: block; }
+        #info {
+            position: absolute;
+            top: 10px;
+            width: 100%;
+            text-align: center;
+            z-index: 100;
+            font-family: monospace;
+            font-size: 1.05em;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">Click and drag to cut the cloth</div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- SETTINGS ---
+        const SETTINGS = {
+            gridSize: 40,       // Increased resolution for smoother cuts
+            clothSize: 10,      // World units
+            stiffness: 0.8,     // Spring stiffness (0..1)
+            damping: 0.98,      // Velocity damping
+            gravity: -9.8,
+            timestep: 18 / 1000, // Simulation timestep
+            constraintPasses: 3,// More passes = stiffer, more stable
+            cutRadius: 0.8,     // Larger radius for more dramatic cuts
+            maxSimSteps: 5      // safety cap to avoid huge step counts
+        };
+
+        let scene, camera, renderer, controls;
+        let cloth, clothParticles, clothSprings;
+        let mouse, raycaster, isCutting;
+        let lastTime;
+
+        // Track cut paths for visual debugging
+        let cutPath = [];
+        const cutPoints = [];
+
+        // --- Particle & Spring classes ---
+        class Particle {
+            constructor(x, y, z, invMass) {
+                this.position = new THREE.Vector3(x, y, z);
+                this.prevPosition = new THREE.Vector3(x, y, z);
+                this.acceleration = new THREE.Vector3(0, 0, 0);
+                this.invMass = invMass; // 0 for fixed particles
+                this.isCut = false; // Track if particle is part of a cut
+            }
+
+            // IMPORTANT: do NOT mutate the incoming force vector (clone)
+            applyForce(force) {
+                // scale by invMass into a temp vector
+                this.acceleration.add(force.clone().multiplyScalar(this.invMass));
+            }
+        }
+
+        class Spring {
+            constructor(p1, p2, p1_idx, p2_idx, restLength) {
+                this.p1 = p1;
+                this.p2 = p2;
+                this.p1_idx = p1_idx;
+                this.p2_idx = p2_idx;
+                this.restLength = restLength;
+                this.isActive = true;
+            }
+        }
+
+        // --- Cloth creation ---
+        function createCloth() {
+            const { gridSize, clothSize } = SETTINGS;
+            const clothGeometry = new THREE.PlaneGeometry(clothSize, clothSize, gridSize, gridSize);
+            clothGeometry.rotateX(-Math.PI / 2); // lay flat
+
+            const clothMaterial = new THREE.MeshPhongMaterial({
+                color: 0xff0000,
+                specular: 0x010101,
+                shininess: 10,
+                side: THREE.DoubleSide,
+                wireframe: false
+            });
+
+            cloth = new THREE.Mesh(clothGeometry, clothMaterial);
+            cloth.castShadow = true;
+            cloth.receiveShadow = true;
+            scene.add(cloth);
+
+            // create particles
+            clothParticles = [];
+            const positions = clothGeometry.attributes.position;
+            for (let i = 0; i < positions.count; i++) {
+                const pos = new THREE.Vector3().fromBufferAttribute(positions, i);
+
+                // Pin the top row for a more natural flag-like behavior
+                const isTopRow = (Math.floor(i / (gridSize + 1)) === 0);
+                const invMass = isTopRow ? 0 : 1;
+                clothParticles.push(new Particle(pos.x, pos.y, pos.z, invMass));
+            }
+
+            // create springs (from triangle indices) avoiding duplicates
+            clothSprings = [];
+            const indices = clothGeometry.index.array;
+            const edges = new Set();
+
+            for (let i = 0; i < indices.length; i += 3) {
+                const i1 = indices[i];
+                const i2 = indices[i + 1];
+                const i3 = indices[i + 2];
+
+                addSpring(i1, i2, edges);
+                addSpring(i2, i3, edges);
+                addSpring(i1, i3, edges);
+            }
+
+            // shear diagonals to improve stability
+            for (let y = 0; y < gridSize; y++) {
+                for (let x = 0; x < gridSize; x++) {
+                    const i1 = y * (gridSize + 1) + x;
+                    const i2 = (y + 1) * (gridSize + 1) + (x + 1);
+                    const i3 = (y + 1) * (gridSize + 1) + x;
+                    const i4 = y * (gridSize + 1) + (x + 1);
+
+                    addSpring(i1, i2, edges);
+                    addSpring(i3, i4, edges);
+                }
+            }
+
+            // keep a copy of original indices for rebuilds
+            cloth.userData.originalIndex = Array.from(indices);
+            cloth.userData.triangles = [];
+            for (let i = 0; i < indices.length; i += 3) {
+                cloth.userData.triangles.push([
+                    indices[i],
+                    indices[i + 1],
+                    indices[i + 2]
+                ]);
+            }
+        }
+
+        function addSpring(i1, i2, edgeSet) {
+            const key = (i1 < i2) ? `${i1}_${i2}` : `${i2}_${i1}`;
+            if (!edgeSet.has(key)) {
+                edgeSet.add(key);
+                const p1 = clothParticles[i1];
+                const p2 = clothParticles[i2];
+                const restLength = p1.position.distanceTo(p2.position);
+                clothSprings.push(new Spring(p1, p2, i1, i2, restLength));
+            }
+        }
+
+        // --- Simulation ---
+        function simulate(dt) {
+            const gravityForce = new THREE.Vector3(0, SETTINGS.gravity, 0);
+
+            // 1) Apply global forces (gravity)
+            for (const particle of clothParticles) {
+                if (particle.invMass > 0) {
+                    // applyForce clones internally, so gravityForce won't be mutated
+                    particle.applyForce(gravityForce);
+                }
+            }
+
+            // 2) Verlet integration (use clones so we don't mutate acceleration)
+            for (const particle of clothParticles) {
+                if (particle.invMass === 0) continue; // skip fixed particles
+
+                // velocity = (pos - prev) * damping
+                const velocity = particle.position.clone().sub(particle.prevPosition).multiplyScalar(SETTINGS.damping);
+
+                // store current position into prevPosition BEFORE updating
+                particle.prevPosition.copy(particle.position);
+
+                // delta = velocity + acceleration * dt*dt
+                const accelTerm = particle.acceleration.clone().multiplyScalar(dt * dt);
+                const delta = velocity.add(accelTerm);
+
+                particle.position.add(delta);
+
+                // reset acceleration
+                particle.acceleration.set(0, 0, 0);
+            }
+
+            // 3) Satisfy constraints (springs)
+            for (let pass = 0; pass < SETTINGS.constraintPasses; pass++) {
+                for (const spring of clothSprings) {
+                    if (!spring.isActive) continue;
+
+                    const delta = spring.p2.position.clone().sub(spring.p1.position);
+                    const currentLength = delta.length();
+                    if (currentLength === 0) continue;
+
+                    const diff = (currentLength - spring.restLength) / currentLength;
+                    const correction = delta.multiplyScalar(0.5 * SETTINGS.stiffness * diff);
+
+                    if (spring.p1.invMass > 0) {
+                        spring.p1.position.add(correction);
+                    }
+                    if (spring.p2.invMass > 0) {
+                        spring.p2.position.sub(correction);
+                    }
+                }
+            }
+
+            // 4) simple ground collision
+            for (const particle of clothParticles) {
+                if (particle.position.y < -SETTINGS.clothSize / 2) {
+                    particle.position.y = -SETTINGS.clothSize / 2;
+                }
+            }
+
+            // 5) update mesh positions & normals
+            const positions = cloth.geometry.attributes.position;
+            for (let i = 0; i < clothParticles.length; i++) {
+                positions.setXYZ(i, clothParticles[i].position.x, clothParticles[i].position.y, clothParticles[i].position.z);
+            }
+            positions.needsUpdate = true;
+            cloth.geometry.computeVertexNormals();
+        }
+
+        // --- Smooth Cutting ---
+        function attemptCut() {
+            if (!isCutting) return;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(cloth);
+
+            if (intersects.length > 0) {
+                const cutPoint = intersects[0].point;
+                const faceIndex = intersects[0].faceIndex;
+                
+                // Store cut point for path
+                cutPoints.push(cutPoint.clone());
+                
+                // Cut based on triangle proximity for smoother results
+                cutTrianglesNearPoint(cutPoint);
+                
+                // Also cut springs along the path for physical separation
+                cutSpringsAlongPath();
+                
+                updateClothIndexBuffer();
+            }
+        }
+
+        function cutTrianglesNearPoint(cutPoint) {
+            const triangles = cloth.userData.triangles;
+            const cutRadiusSq = SETTINGS.cutRadius * SETTINGS.cutRadius;
+            
+            for (let i = 0; i < triangles.length; i++) {
+                const triangle = triangles[i];
+                if (!triangle) continue; // Skip already cut triangles
+                
+                // Calculate triangle centroid
+                const p1 = clothParticles[triangle[0]].position;
+                const p2 = clothParticles[triangle[1]].position;
+                const p3 = clothParticles[triangle[2]].position;
+                
+                const centroid = new THREE.Vector3()
+                    .add(p1)
+                    .add(p2)
+                    .add(p3)
+                    .multiplyScalar(1/3);
+                
+                // Check if centroid is within cut radius
+                const distSq = centroid.distanceToSquared(cutPoint);
+                if (distSq < cutRadiusSq) {
+                    // Remove triangle completely
+                    cloth.userData.triangles[i] = null;
+                    
+                    // Mark particles as cut (for spring cutting)
+                    clothParticles[triangle[0]].isCut = true;
+                    clothParticles[triangle[1]].isCut = true;
+                    clothParticles[triangle[2]].isCut = true;
+                }
+            }
+        }
+
+        function cutSpringsAlongPath() {
+            if (cutPoints.length < 2) return;
+            
+            // Cut springs that cross the cutting path
+            for (const spring of clothSprings) {
+                if (!spring.isActive) continue;
+                
+                const p1 = spring.p1.position;
+                const p2 = spring.p2.position;
+                
+                // Check if this spring crosses any segment of the cut path
+                for (let i = 0; i < cutPoints.length - 1; i++) {
+                    const cutStart = cutPoints[i];
+                    const cutEnd = cutPoints[i + 1];
+                    
+                    if (lineSegmentsIntersect(p1, p2, cutStart, cutEnd)) {
+                        spring.isActive = false;
+                        break;
+                    }
+                }
+                
+                // Also cut springs where both particles are marked as cut
+                if (spring.p1.isCut && spring.p2.isCut) {
+                    spring.isActive = false;
+                }
+            }
+        }
+
+        function lineSegmentsIntersect(a1, a2, b1, b2) {
+            // Basic line segment intersection test
+            const denominator = ((b2.y - b1.y) * (a2.x - a1.x) - (b2.x - b1.x) * (a2.y - a1.y));
+            if (denominator === 0) return false;
+            
+            const ua = ((b2.x - b1.x) * (a1.y - b1.y) - (b2.y - b1.y) * (a1.x - b1.x)) / denominator;
+            const ub = ((a2.x - a1.x) * (a1.y - b1.y) - (a2.y - a1.y) * (a1.x - b1.x)) / denominator;
+            
+            return ua >= 0 && ua <= 1 && ub >= 0 && ub <= 1;
+        }
+
+        function updateClothIndexBuffer() {
+            const triangles = cloth.userData.triangles;
+            const newIndices = [];
+            
+            // Collect only active triangles
+            for (let i = 0; i < triangles.length; i++) {
+                const triangle = triangles[i];
+                if (triangle) {
+                    newIndices.push(triangle[0], triangle[1], triangle[2]);
+                }
+            }
+            
+            // Recreate the geometry completely
+            const oldGeometry = cloth.geometry;
+            const newGeometry = new THREE.BufferGeometry();
+            
+            // Copy position and normal attributes from old geometry
+            newGeometry.setAttribute('position', oldGeometry.attributes.position);
+            newGeometry.setAttribute('normal', oldGeometry.attributes.normal);
+            
+            // Set new index with only active triangles
+            newGeometry.setIndex(new THREE.BufferAttribute(new Uint32Array(newIndices), 1));
+            
+            // Replace geometry
+            cloth.geometry.dispose();
+            cloth.geometry = newGeometry;
+            
+            // Recompute normals
+            cloth.geometry.computeVertexNormals();
+            cloth.geometry.computeBoundingSphere();
+        }
+
+        // --- Scene setup & animation ---
+        function init() {
+            lastTime = performance.now();
+
+            scene = new THREE.Scene();
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 5, 15);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            document.body.appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+            scene.add(ambientLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+            dirLight.position.set(5, 10, 7.5);
+            dirLight.castShadow = true;
+            dirLight.shadow.mapSize.width = 2048;
+            dirLight.shadow.mapSize.height = 2048;
+            dirLight.shadow.camera.near = 0.5;
+            dirLight.shadow.camera.far = 50;
+            scene.add(dirLight);
+
+            const groundGeo = new THREE.PlaneGeometry(100, 100);
+            const groundMat = new THREE.MeshStandardMaterial({ color: 0x444444, side: THREE.DoubleSide });
+            const ground = new THREE.Mesh(groundGeo, groundMat);
+            ground.rotation.x = -Math.PI / 2;
+            ground.position.y = -SETTINGS.clothSize / 2 - 0.01;
+            ground.receiveShadow = true;
+            scene.add(ground);
+
+            // create cloth
+            createCloth();
+
+            // interaction
+            mouse = new THREE.Vector2();
+            raycaster = new THREE.Raycaster();
+            isCutting = false;
+
+            window.addEventListener('resize', onWindowResize);
+            window.addEventListener('pointerdown', onPointerDown);
+            window.addEventListener('pointerup', onPointerUp);
+            window.addEventListener('pointermove', onPointerMove);
+
+            // small helpful camera target
+            controls.target.set(0, 0, 0);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function onPointerDown(event) {
+            isCutting = true;
+            cutPoints.length = 0; // Clear previous cut path
+            updateMouse(event);
+            attemptCut(); // immediate cut on pointerdown
+        }
+
+        function onPointerUp() {
+            isCutting = false;
+        }
+
+        function onPointerMove(event) {
+            updateMouse(event);
+            if (isCutting) {
+                attemptCut();
+            }
+        }
+
+        function updateMouse(event) {
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const now = performance.now();
+            let delta = (now - lastTime) / 1000.0;
+
+            if (delta > 0) {
+                // keep step count reasonable (safety cap)
+                let steps = Math.ceil(delta / SETTINGS.timestep);
+                steps = Math.min(steps, Math.max(1, SETTINGS.maxSimSteps));
+                for (let i = 0; i < steps; i++) {
+                    simulate(SETTINGS.timestep);
+                }
+            }
+            lastTime = now;
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        init();
+        animate();  
+    </script>
+</body>
+</html>
